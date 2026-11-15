@@ -1,0 +1,347 @@
+# name: test/sql/airflow.test
+# description: Airflow 3 (/api/v2) through DuckDB, against the recorded replay in test/mock_api (ci/run-integration.sh)
+# group: [airflow]
+
+require vgi
+
+require-env AIRFLOW_WORKER
+
+require-env AIRFLOW_MOCK_V3
+
+# JSON columns (conf, extra, details) use the json extension's operators.
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'airflow' (TYPE vgi, LOCATION '{AIRFLOW_WORKER}');
+
+# ---------------------------------------------------------------- catalog shape
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'airflow' ORDER BY schema_name, table_name;
+----
+asset_events
+assets
+connections
+dag_runs
+dags
+event_logs
+import_errors
+pools
+task_instance_tries
+task_instances
+variables
+xcom_entries
+runs
+task_runs
+
+# No secret yet: a clear error, not a crash.
+statement error
+SELECT count(*) FROM airflow.main.dags;
+----
+<REGEX>:.*no Airflow credentials.*
+
+# A secret of the wrong shape is rejected with the field name.
+statement ok
+CREATE SECRET af_bad (TYPE airflow, BASE_URL 'not-a-url', TOKEN 'x');
+
+statement error
+SELECT count(*) FROM airflow.main.dags;
+----
+<REGEX>:.*BASE_URL must be set to an http.*
+
+statement ok
+DROP SECRET af_bad;
+
+# Username + password: the worker probes /api/v2/version, exchanges them at /auth/token for a JWT.
+statement ok
+CREATE SECRET af (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V3}', USERNAME 'admin', PASSWORD 'admin-fixture-pw');
+
+# ------------------------------------------------------------------------- dags
+
+query TTTTT
+SELECT dag_id, is_paused, is_active, schedule, tags FROM airflow.main.dags ORDER BY dag_id;
+----
+etl_orders	false	true	0 0 * * *	[etl, orders]
+flaky_report	false	true	NULL	[reports]
+orders_consumer	false	true	Asset	[dashboards]
+
+query T
+SELECT dag_id FROM airflow.main.dags WHERE dag_id = 'flaky_report';
+----
+flaky_report
+
+# ----------------------------------------------------------------------- dag runs
+
+query TTTT
+SELECT dag_id, run_id, state, run_type FROM airflow.main.dag_runs WHERE dag_id IN ('etl_orders', 'flaky_report') ORDER BY dag_id, run_id;
+----
+etl_orders	manual_orders_1	success	manual
+etl_orders	manual_orders_2	success	manual
+etl_orders	scheduled__2026-11-15T00:00:00+00:00	success	scheduled
+flaky_report	manual_report_1	failed	manual
+
+query TT
+SELECT dag_id, run_id FROM airflow.main.dag_runs WHERE state = 'failed';
+----
+flaky_report	manual_report_1
+
+# Logical-date range (pushed as logical_date_gte / _lt).
+query TT
+SELECT run_id, logical_date FROM airflow.main.dag_runs WHERE logical_date >= TIMESTAMPTZ '2026-11-10 00:00:00+00' AND logical_date < TIMESTAMPTZ '2026-11-12 00:00:00+00' ORDER BY logical_date;
+----
+manual_orders_1	2026-11-10 00:00:00+00
+manual_report_1	2026-11-11 00:00:00+00
+
+# Strict lower bound must not include the boundary row.
+query T
+SELECT run_id FROM airflow.main.dag_runs WHERE logical_date > TIMESTAMPTZ '2026-11-10 00:00:00+00' AND logical_date <= TIMESTAMPTZ '2026-11-11 00:00:00+00';
+----
+manual_report_1
+
+query II
+SELECT count(*), count(*) FILTER (WHERE run_type = 'asset_triggered') FROM airflow.main.dag_runs WHERE dag_id = 'orders_consumer';
+----
+3	3
+
+query T
+SELECT conf->>'source' FROM airflow.main.dag_runs WHERE dag_id = 'etl_orders' AND run_id = 'manual_orders_1';
+----
+fixture
+
+# A DAG that does not exist is an empty result (the 404 is swallowed).
+query I
+SELECT count(*) FROM airflow.main.dag_runs WHERE dag_id = 'no_such_dag';
+----
+0
+
+# ----------------------------------------------------------------- task instances
+
+query TTII
+SELECT task_id, state, try_number, map_index FROM airflow.main.task_instances WHERE dag_id = 'flaky_report' AND run_id = 'manual_report_1' ORDER BY task_id;
+----
+gather	success	1	-1
+publish	upstream_failed	0	-1
+render	failed	2	-1
+
+query TI
+SELECT state, count(*) FROM airflow.main.task_instances GROUP BY state ORDER BY state;
+----
+failed	1
+success	13
+upstream_failed	1
+
+query I
+SELECT count(*) FROM airflow.main.task_instances WHERE task_id = 'load' AND state = 'success';
+----
+3
+
+# ------------------------------------------------------------------------- tries
+
+query TII
+SELECT task_id, count(*), max(try_number) FROM airflow.main.task_instance_tries WHERE dag_id = 'flaky_report' GROUP BY task_id ORDER BY task_id;
+----
+gather	1	1
+render	2	2
+
+# --------------------------------------------------------------------------- logs
+
+query IT
+SELECT try_number, message FROM airflow.main.task_logs('flaky_report', 'manual_report_1', 'render') WHERE level = 'error' ORDER BY try_number;
+----
+1	Task failed with exception
+2	Task failed with exception
+
+query T
+SELECT details->'$.error_detail[0].exc_value'->>'$' FROM airflow.main.task_logs('flaky_report', 'manual_report_1', 'render', try_number := 2) WHERE level = 'error';
+----
+template 'weekly.html' not found
+
+query T
+SELECT message FROM airflow.main.task_logs('etl_orders', 'manual_orders_1', 'extract') WHERE logger = 'task.stdout';
+----
+extracting 3 orders
+
+# --------------------------------------------------------------------- xcom entries
+
+query TTI
+SELECT task_id, key, count(*) FROM airflow.main.xcom_entries WHERE dag_id = 'etl_orders' GROUP BY ALL ORDER BY ALL;
+----
+extract	return_value	3
+transform	count	3
+transform	return_value	3
+transform	total_cents	3
+
+query T
+SELECT DISTINCT task_id FROM airflow.main.xcom_entries WHERE dag_id = 'etl_orders' AND run_id = 'manual_orders_1' ORDER BY task_id;
+----
+extract
+transform
+
+# ----------------------------------------------------------------- assets + events
+
+query ITTT
+SELECT asset_id, uri, consuming_dags, producing_tasks FROM airflow.main.assets;
+----
+1	s3://warehouse/orders	[orders_consumer]	[{'dag_id': etl_orders, 'task_id': load}]
+
+query II
+SELECT count(*), sum(len(created_runs)) FROM airflow.main.asset_events WHERE source_dag_id = 'etl_orders';
+----
+3	3
+
+query I
+SELECT count(*) FROM airflow.main.asset_events WHERE timestamp >= TIMESTAMPTZ '2026-11-15 05:51:00+00';
+----
+1
+
+# ------------------------------------------------------------- audit and health
+
+query T
+SELECT filename FROM airflow.main.import_errors;
+----
+broken_dag.py
+
+query T
+SELECT stack_trace LIKE '%No module named%this_module_does_not_exist%' FROM airflow.main.import_errors;
+----
+true
+
+query I
+SELECT count(*) > 0 FROM airflow.main.event_logs WHERE event IN ('cli_scheduler', 'cli_api_server');
+----
+true
+
+query I
+SELECT count(*) FROM airflow.main.event_logs WHERE dag_id = 'flaky_report' AND event_time > TIMESTAMPTZ '2026-11-15 05:50:00+00' AND event_time < TIMESTAMPTZ '2026-11-15 05:51:00+00';
+----
+<REGEX>:[1-9][0-9]*
+
+# ---------------------------------------------------------------------- config
+
+query TIII
+SELECT name, slots, open_slots, running_slots FROM airflow.main.pools ORDER BY name;
+----
+default_pool	128	128	0
+reporting	3	3	0
+
+# Values are always masked in the table.
+query TTT
+SELECT key, value, is_masked FROM airflow.main.variables ORDER BY key;
+----
+report_recipients	***	true
+slack_api_token	***	true
+warehouse_region	***	true
+
+query TTT
+SELECT key, value, is_masked FROM airflow.main.variable_values() ORDER BY key;
+----
+report_recipients	***	true
+slack_api_token	***	true
+warehouse_region	***	true
+
+# reveal := true shows only values whose key and value do not look secret.
+query TTT
+SELECT key, value, is_masked FROM airflow.main.variable_values(reveal := true) ORDER BY key;
+----
+report_recipients	["ops@example.com", "data@example.com"]	false
+slack_api_token	***	true
+warehouse_region	us-east-1	false
+
+query TTTT
+SELECT connection_id, conn_type, has_password, extra FROM airflow.main.connections ORDER BY connection_id;
+----
+http_metrics	http	false	{"timeout": 30}
+warehouse_pg	postgres	true	{"api_key": "***", "sslmode": "require"}
+
+query I
+SELECT count(*) FROM (DESCRIBE airflow.main.connections) WHERE column_name = 'password';
+----
+0
+
+# ----------------------------------------------------------------------- unified
+
+query TI
+SELECT status, count(*) FROM airflow.unified.runs GROUP BY status ORDER BY status;
+----
+failed	1
+success	6
+
+query TTTTT
+SELECT orchestrator, run_id, pipeline, status, trigger FROM airflow.unified.runs WHERE run_id = 'flaky_report/manual_report_1';
+----
+airflow	flaky_report/manual_report_1	flaky_report	failed	api
+
+query TT
+SELECT trigger, count(*) FROM airflow.unified.runs GROUP BY trigger ORDER BY trigger;
+----
+api	3
+event	3
+schedule	1
+
+query T
+SELECT url = '{AIRFLOW_MOCK_V3}/dags/flaky_report/runs/manual_report_1' FROM airflow.unified.runs WHERE pipeline = 'flaky_report';
+----
+true
+
+query TTTI
+SELECT task_run_id, status, raw_status, attempt FROM airflow.unified.task_runs WHERE run_id = 'flaky_report/manual_report_1' ORDER BY task_run_id;
+----
+flaky_report/manual_report_1/gather	success	success	1
+flaky_report/manual_report_1/publish	skipped	upstream_failed	0
+flaky_report/manual_report_1/render	failed	failed	2
+
+query TTI
+SELECT r.pipeline, t.status, count(*) FROM airflow.unified.task_runs t JOIN airflow.unified.runs r USING (run_id) GROUP BY ALL ORDER BY ALL;
+----
+etl_orders	success	9
+flaky_report	failed	1
+flaky_report	skipped	1
+flaky_report	success	1
+orders_consumer	success	3
+
+query I
+SELECT count(*) FROM airflow.unified.task_runs WHERE status = 'cancelled';
+----
+0
+
+# --------------------------------------------------------- bearer token (Astronomer)
+
+statement ok
+DROP SECRET af;
+
+statement ok
+CREATE SECRET astro (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V3}', TOKEN 'astro-fixture-token', PLATFORM 'astronomer');
+
+query I
+SELECT count(*) FROM airflow.main.dags;
+----
+3
+
+statement ok
+DROP SECRET astro;
+
+statement ok
+CREATE SECRET wrong (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V3}', TOKEN 'not-the-token');
+
+statement error
+SELECT count(*) FROM airflow.main.dags;
+----
+<REGEX>:.*HTTP 401.*
+
+statement ok
+DROP SECRET wrong;
+
+statement ok
+CREATE SECRET mwaa (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V3}', TOKEN 'x', PLATFORM 'mwaa');
+
+statement error
+SELECT count(*) FROM airflow.main.dags;
+----
+<REGEX>:.*mwaa.*not supported yet.*
+
+statement ok
+DROP SECRET mwaa;
+
+statement ok
+DETACH airflow;

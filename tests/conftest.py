@@ -1,32 +1,31 @@
-"""Shared fixtures: a worker client and the local mock API."""
+"""Shared fixtures: replays of the recorded Airflow 2 and 3 APIs."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from vgi.client import Client
+
+from airflow_worker.client import clear_caches
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-@pytest.fixture(scope="session")
-def client() -> Iterator[Client]:
-    """A client that launches the worker as a subprocess, the way DuckDB does."""
-    with Client([sys.executable, "-m", "starter_worker.worker"]) as c:
-        yield c
-
-
-@pytest.fixture(scope="session")
-def mock_api() -> Iterator[str]:
-    """Start test/mock_api/server.py on a free port and return its base URL."""
+def _serve(fixture: str, **env: str) -> Iterator[str]:
     proc = subprocess.Popen(
-        [sys.executable, str(ROOT / "test" / "mock_api" / "server.py")],
+        [
+            sys.executable,
+            str(ROOT / "test" / "mock_api" / "server.py"),
+            "--fixture",
+            str(ROOT / "test" / "fixtures" / fixture),
+        ],
         stdout=subprocess.PIPE,
         text=True,
+        env={**os.environ, **env},
     )
     assert proc.stdout is not None
     line = proc.stdout.readline().strip()
@@ -34,3 +33,20 @@ def mock_api() -> Iterator[str]:
     yield f"http://127.0.0.1:{line.removeprefix('PORT:')}"
     proc.terminate()
     proc.wait(timeout=10)
+
+
+@pytest.fixture(scope="session")
+def mock_v3() -> Iterator[str]:
+    """Airflow 3.4 replay (/api/v2), rate-limiting the first request to every path."""
+    yield from _serve("airflow3.json", MOCK_FLAKY="1")
+
+
+@pytest.fixture(scope="session")
+def mock_v2() -> Iterator[str]:
+    """Airflow 2.11 replay (/api/v1)."""
+    yield from _serve("airflow2.json")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_caches() -> None:
+    clear_caches()

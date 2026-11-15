@@ -2,6 +2,15 @@
 
 ## 0.1.0 (unreleased)
 
-Initial worker generated from the VGI starter template.
+Initial release: Airflow 2.x (`/api/v1`) and 3.x (`/api/v2`) stable REST API as SQL.
 
-Targets: vgi-python 0.51 · VGI protocol 3.3 · Haybarn 2.0.0rc11 · vgi-lint-check 2.x (unpinned)
+- `airflow.main`: dags, dag_runs, task_instances, task_instance_tries, xcom_entries, assets,
+  asset_events, event_logs, import_errors, pools, variables (masked), connections (no passwords);
+  `task_logs(...)`, `variable_values(reveal := false)`.
+- `airflow.unified`: runs, task_runs (shared orchestrator shape), `unified_status(state)`.
+- `airflow` secret: base_url + token / basic auth / Airflow 3 `/auth/token` exchange; Astronomer
+  and Cloud Composer bearer tokens. MWAA not yet supported.
+- Filter pushdown into API paths and parameters; offset paging with a resumable cursor; 429 retry.
+- Tests replay responses recorded from Airflow 3.4.0 and 2.11.2 `airflow standalone` containers.
+
+Built from vgi-starter-python v1.3.0. Targets: vgi-python 0.51 · VGI protocol 3.3 · Haybarn 2.0.0rc11

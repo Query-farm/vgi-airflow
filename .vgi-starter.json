@@ -12,5 +12,8 @@
   "optional_files": [
     ".github/workflows/nightly.yml",
     ".github/dependabot.yml"
-  ]
+  ],
+  "name": "airflow",
+  "repo": "your-org/vgi-airflow",
+  "initialized": "2026-11-15"
 }

@@ -1,0 +1,165 @@
+# name: test/sql/airflow_v1.test
+# description: Airflow 2 (/api/v1, basic auth) through DuckDB, against the recorded replay in test/mock_api
+# group: [airflow]
+
+require vgi
+
+require-env AIRFLOW_WORKER
+
+require-env AIRFLOW_MOCK_V2
+
+statement ok
+ATTACH 'airflow' (TYPE vgi, LOCATION '{AIRFLOW_WORKER}');
+
+# Airflow 2: /api/v2/version is a 404, so the worker falls back to /api/v1 with basic auth.
+statement ok
+CREATE SECRET af2 (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V2}', USERNAME 'admin', PASSWORD 'admin-fixture-pw');
+
+query TTTT
+SELECT dag_id, is_active, schedule, owners FROM airflow.main.dags ORDER BY dag_id;
+----
+etl_orders	true	@daily	[airflow]
+flaky_report	true	NULL	[airflow]
+orders_consumer	true	Dataset	[airflow]
+
+query TTTT
+SELECT dag_id, run_id, state, run_type FROM airflow.main.dag_runs ORDER BY dag_id, run_id;
+----
+etl_orders	manual_orders_1	success	manual
+etl_orders	scheduled__2026-11-14T00:00:00+00:00	success	scheduled
+flaky_report	manual_report_1	failed	manual
+orders_consumer	dataset_triggered__2026-11-15T05:54:14.085494+00:00	success	dataset_triggered
+orders_consumer	dataset_triggered__2026-11-15T05:54:47.475083+00:00	success	dataset_triggered
+
+# execution_date_gte/_lte on v1; the strict bound is widened then re-checked by DuckDB.
+query T
+SELECT run_id FROM airflow.main.dag_runs WHERE logical_date > TIMESTAMPTZ '2026-11-10 00:00:00+00' AND logical_date <= TIMESTAMPTZ '2026-11-11 00:00:00+00';
+----
+manual_report_1
+
+# run_type and run_id are not v1 API filters: DuckDB filters them (the replay 400s on unknown parameters).
+query I
+SELECT count(*) FROM airflow.main.dag_runs WHERE run_type = 'dataset_triggered' AND run_id LIKE 'dataset%';
+----
+2
+
+query TTI
+SELECT task_id, state, try_number FROM airflow.main.task_instances WHERE dag_id = 'flaky_report' AND run_id = 'manual_report_1' ORDER BY task_id;
+----
+gather	success	1
+publish	upstream_failed	0
+render	failed	2
+
+query I
+SELECT count(*) FROM airflow.main.task_instances WHERE task_id = 'load';
+----
+2
+
+query TII
+SELECT task_id, count(*), max(try_number) FROM airflow.main.task_instance_tries WHERE dag_id = 'flaky_report' GROUP BY task_id ORDER BY task_id;
+----
+gather	1	1
+render	2	2
+
+# Airflow 2 serves text logs; the worker parses "[ts] {file:line} LEVEL - message".
+query IT
+SELECT try_number, message FROM airflow.main.task_logs('flaky_report', 'manual_report_1', 'render') WHERE level = 'error' ORDER BY try_number, line_number;
+----
+1	Task failed with exception
+1	Failed to execute job 6 for task render (template 'weekly.html' not found; 80)
+2	Task failed with exception
+2	Failed to execute job 7 for task render (template 'weekly.html' not found; 85)
+
+query TT
+SELECT logger, timestamp FROM airflow.main.task_logs('etl_orders', 'manual_orders_1', 'extract') WHERE message = 'extracting 3 orders';
+----
+logging_mixin.py:190	2026-11-15 05:53:40.975+00
+
+# Airflow 2 XCom listings have no run_id: it is filled in from the path when filtered.
+query TT
+SELECT task_id, run_id FROM airflow.main.xcom_entries WHERE dag_id = 'etl_orders' AND run_id = 'manual_orders_1' AND key = 'return_value' ORDER BY task_id;
+----
+extract	manual_orders_1
+transform	manual_orders_1
+
+query ITT
+SELECT asset_id, uri, consuming_dags FROM airflow.main.assets;
+----
+1	s3://warehouse/orders	[orders_consumer]
+
+query TT
+SELECT source_run_id, created_runs[1].dag_id FROM airflow.main.asset_events WHERE asset_id = 1 ORDER BY event_id;
+----
+manual_orders_1	orders_consumer
+scheduled__2026-11-14T00:00:00+00:00	orders_consumer
+
+query T
+SELECT filename FROM airflow.main.import_errors;
+----
+/opt/airflow/dags/broken_dag.py
+
+# Airflow 2 returns variable values verbatim, secrets included: the worker masks them.
+query TTT
+SELECT key, value, is_masked FROM airflow.main.variables ORDER BY key;
+----
+slack_api_token	***	true
+warehouse_region	***	true
+
+query TT
+SELECT key, value FROM airflow.main.variable_values(reveal := true) ORDER BY key;
+----
+slack_api_token	***
+warehouse_region	us-east-1
+
+query I
+SELECT count(*) FROM airflow.main.variable_values(reveal := true) WHERE value LIKE '%xoxb%';
+----
+0
+
+# 62 connections (Airflow's defaults plus the fixture's) span several pages at PAGE_SIZE 25.
+statement ok
+DROP SECRET af2;
+
+statement ok
+CREATE SECRET af2 (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V2}', USERNAME 'admin', PASSWORD 'admin-fixture-pw', PAGE_SIZE 25);
+
+query II
+SELECT count(*), count(DISTINCT connection_id) FROM airflow.main.connections;
+----
+62	62
+
+query TTTT
+SELECT conn_type, host, login, has_password FROM airflow.main.connections WHERE connection_id = 'warehouse_pg';
+----
+postgres	db.example.internal	etl	NULL
+
+query TI
+SELECT status, count(*) FROM airflow.unified.runs GROUP BY status ORDER BY status;
+----
+failed	1
+success	4
+
+query TT
+SELECT trigger, url LIKE '%/dags/flaky_report/grid?dag_run_id=manual_report_1' FROM airflow.unified.runs WHERE pipeline = 'flaky_report';
+----
+manual	true
+
+query TT
+SELECT task_run_id, status FROM airflow.unified.task_runs WHERE run_id = 'flaky_report/manual_report_1' AND task_name = 'publish';
+----
+flaky_report/manual_report_1/publish	skipped
+
+# Wrong password: basic auth fails with the status code in the message.
+statement ok
+DROP SECRET af2;
+
+statement ok
+CREATE SECRET bad (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V2}', USERNAME 'admin', PASSWORD 'wrong');
+
+statement error
+SELECT count(*) FROM airflow.main.pools;
+----
+<REGEX>:.*HTTP 403.*
+
+statement ok
+DETACH airflow;

@@ -1,16 +1,61 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it against reference_sql.
 # See https://github.com/Query-farm/vgi-lint-check (VGI920).
+#
+# Credential-gated: every task but normalize_state needs an `airflow` secret. The data is the
+# recorded fixture deployment (test/fixtures/airflow3.json replayed by test/mock_api/server.py),
+# which never changes, so reference results are deterministic. Run --ai with
+#   CREATE SECRET (TYPE airflow, BASE_URL '<replay url>', TOKEN 'astro-fixture-token');
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT starter.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM starter.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM starter.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
+  - name: failed_runs
+    reference_sql: SELECT dag_id, run_id FROM airflow.main.dag_runs WHERE state = 'failed' ORDER BY ALL
+    unordered: true
+  - name: retried_task
+    reference_sql: >-
+      SELECT task_id, count(*) AS attempts FROM airflow.main.task_instance_tries
+      GROUP BY dag_id, run_id, task_id HAVING count(*) > 1
+  - name: runs_per_status
+    reference_sql: SELECT status, count(*) AS runs FROM airflow.unified.runs GROUP BY status ORDER BY status
+    unordered: true
+  - name: broken_files
+    reference_sql: SELECT filename FROM airflow.main.import_errors
+  - name: etl_tagged_dags
+    reference_sql: SELECT dag_id FROM airflow.main.dags WHERE list_contains(tags, 'etl')
+  - name: skipped_tasks
+    reference_sql: >-
+      SELECT dag_id, run_id, task_id FROM airflow.main.task_instances WHERE state = 'upstream_failed' ORDER BY ALL
+    unordered: true
+  - name: render_error
+    reference_sql: >-
+      SELECT message FROM airflow.main.task_logs('flaky_report', 'manual_report_1', 'render', try_number := 2)
+      WHERE level = 'error'
+  - name: xcom_keys
+    reference_sql: >-
+      SELECT DISTINCT key FROM airflow.main.xcom_entries WHERE dag_id = 'etl_orders' AND task_id = 'transform'
+      ORDER BY key
+    unordered: true
+  - name: asset_consumers
+    reference_sql: >-
+      SELECT a.consuming_dags, count(e.event_id) AS updates
+      FROM airflow.main.assets a LEFT JOIN airflow.main.asset_events e USING (asset_id)
+      WHERE a.uri = 's3://warehouse/orders' GROUP BY a.consuming_dags
+    ignore_column_names: true
+  - name: audit_events
+    reference_sql: SELECT count(*) FROM airflow.main.event_logs WHERE dag_id = 'flaky_report'
+    ignore_column_names: true
+  - name: pool_capacity
+    reference_sql: SELECT name, slots FROM airflow.main.pools ORDER BY name
+    unordered: true
+  - name: config_inventory
     check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM starter.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+      SELECT (SELECT list(key ORDER BY key) FROM airflow.main.variable_values(reveal := true) WHERE NOT is_masked)
+             = ['report_recipients', 'warehouse_region']
+         AND (SELECT list(connection_id) FROM airflow.main.connections WHERE has_password) = ['warehouse_pg']
+         AND (SELECT count(*) FROM airflow.main.variables WHERE is_masked) = 3
+  - name: unified_task_status
+    reference_sql: >-
+      SELECT t.status, count(*) AS task_runs FROM airflow.unified.task_runs t JOIN airflow.unified.runs r USING (run_id)
+      WHERE r.pipeline = 'flaky_report' GROUP BY t.status ORDER BY t.status
+    unordered: true
+  - name: normalize_state
+    reference_sql: SELECT airflow.unified.unified_status('up_for_reschedule') AS status

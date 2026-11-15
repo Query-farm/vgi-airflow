@@ -4,13 +4,10 @@
 # contract with `vgi-lint spec`.
 
 # The worker to attach, relative to this directory. Build it first with `make build`.
-location = ".venv/bin/vgi-starter-worker"
+location = ".venv/bin/vgi-airflow-worker"
 
-# template-only:start
-fail_on = "info"
-# template-only:end
 # Fail on warnings while you build. Raise this to "info" before you publish the worker.
-# fork-only: fail_on = "warning"
+fail_on = "info"
 
 # Waive a finding only with a kind and a reason, so the waiver can be audited:
 #   domain-exemption  permanent and legitimate for this worker
@@ -19,7 +16,37 @@ fail_on = "info"
 #   tooling-bug       the linter is wrong; report it upstream
 ignore = [
   # { code = "VGI146", kind = "domain-exemption", reason = "every entry point needs a key" },
+  # The first scalar call of a session spawns a fresh Python worker; the query itself takes
+  # ~2 ms (measured), the rest is interpreter start-up, which exceeded 5 s only on a heavily
+  # loaded shared build machine (load average ~190).
+  { code = "VGI908", kind = "timing", reason = "worker cold start on a loaded host; unified_status runs in ~2 ms warm" },
 ]
+
+# VGI808 guesses a foreign key from a `<base>_id` column name. Every real reference in
+# this catalog is declared (dag_runs→dags, task_instances→dag_runs, tries/xcom→task_instances,
+# asset_events→assets, unified.task_runs→unified.runs). What remains are false positives:
+# A table's own key named after the table in the singular (dag_id in dags, asset_id in
+# assets, ...): the rule compares the singular column base with the plural table name.
+[per_object."airflow.main.dags"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "dag_id is this table's own primary key, not a reference to it" }]
+[per_object."airflow.main.assets"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "asset_id is this table's own primary key" }]
+[per_object."airflow.main.connections"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "connection_id is this table's own primary key" }]
+[per_object."airflow.main.import_errors"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "import_error_id is this table's own primary key" }]
+[per_object."airflow.unified.runs"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "run_id is this table's own primary key" }]
+[per_object."airflow.unified.task_runs"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "task_run_id is this table's own primary key; its run_id FK to runs is declared" }]
+# main.dag_runs.run_id is part of dag_runs' own key; the rule matches it to unified.runs, a
+# different schema whose run_id is '<dag_id>/<run_id>', so no FK can exist.
+[per_object."airflow.main.dag_runs"]
+ignore = [{ code = "VGI808", kind = "tooling-bug", reason = "run_id is part of this table's own key; unified.runs is another schema with a different run_id format" }]
+# The audit log keeps entries for DAGs and runs that were deleted since, and CLI events with
+# no DAG at all, so a foreign key from it could not be attested ENFORCED.
+[per_object."airflow.main.event_logs"]
+ignore = [{ code = "VGI808", kind = "domain-exemption", reason = "audit entries outlive deleted DAGs/runs; event_log_id is its own key" }]
 
 # Adopting the gate on a worker that already has findings? Record them once with
 #   vgi-lint lint --baseline vgi-lint-baseline --update-baseline

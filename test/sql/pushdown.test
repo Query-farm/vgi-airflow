@@ -1,0 +1,95 @@
+# name: test/sql/pushdown.test
+# description: SQL predicates reach the Airflow API as path segments / query parameters (checked in the replay's request log)
+# group: [airflow]
+
+require vgi
+
+require-env AIRFLOW_WORKER
+
+require-env AIRFLOW_MOCK_V3
+
+require-env AIRFLOW_MOCK_V2
+
+# The replay's request log is read with read_json over HTTP.
+statement ok
+LOAD httpfs;
+
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'airflow' (TYPE vgi, LOCATION '{AIRFLOW_WORKER}');
+
+statement ok
+CREATE SECRET af (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V3}', USERNAME 'admin', PASSWORD 'admin-fixture-pw');
+
+query I
+SELECT count(*) FROM airflow.main.dag_runs WHERE dag_id = 'flaky_report' AND state IN ('failed', 'queued') AND start_date >= TIMESTAMPTZ '2026-11-15 05:00:00+00' AND start_date < TIMESTAMPTZ '2026-11-16 00:00:00+00';
+----
+1
+
+statement ok
+CREATE VIEW log3 AS SELECT * FROM read_json('{AIRFLOW_MOCK_V3}/__requests', columns = {'method': 'VARCHAR', 'path': 'VARCHAR', 'query': 'JSON'});
+
+# dag_id became the path, state an API filter (both values), the range start_date_gte / start_date_lt.
+query TTTT
+SELECT path, query->'$.state', query->>'$.start_date_gte[0]', query->>'$.start_date_lt[0]' FROM log3 WHERE path = '/api/v2/dags/flaky_report/dagRuns' AND query->>'$.start_date_gte[0]' IS NOT NULL LIMIT 1;
+----
+/api/v2/dags/flaky_report/dagRuns	["failed","queued"]	2026-11-15T05:00:00+00:00	2026-11-16T00:00:00+00:00
+
+# IN on dag_id fans out into one path per DAG.
+query I
+SELECT count(*) FROM airflow.main.task_instances WHERE dag_id IN ('etl_orders', 'flaky_report') AND run_id = 'manual_report_1' AND task_id = 'render';
+----
+1
+
+query T
+SELECT DISTINCT path FROM log3 WHERE path LIKE '%/dagRuns/manual_report_1/taskInstances' AND query->>'$.task_id[0]' = 'render' ORDER BY path;
+----
+/api/v2/dags/etl_orders/dagRuns/manual_report_1/taskInstances
+/api/v2/dags/flaky_report/dagRuns/manual_report_1/taskInstances
+
+# unified.runs: pipeline → path, status → raw states, run_id → path + run_id_pattern.
+query I
+SELECT count(*) FROM airflow.unified.runs WHERE run_id = 'etl_orders/manual_orders_2' AND status = 'success';
+----
+1
+
+query TT
+SELECT query->>'$.run_id_pattern[0]', query->'$.state' FROM log3 WHERE path = '/api/v2/dags/etl_orders/dagRuns' AND query->>'$.run_id_pattern[0]' = 'manual_orders_2' LIMIT 1;
+----
+manual_orders_2	["success"]
+
+# A status that maps to no Airflow DAG-run state never calls the API, and is empty.
+query I
+SELECT count(*) FROM airflow.unified.runs WHERE status = 'cancelled';
+----
+0
+
+statement ok
+DROP SECRET af;
+
+# Airflow 2 takes execution_date_*; Airflow-3-only filters (run_type, task_id) stay in DuckDB.
+statement ok
+CREATE SECRET af2 (TYPE airflow, BASE_URL '{AIRFLOW_MOCK_V2}', USERNAME 'admin', PASSWORD 'admin-fixture-pw');
+
+query I
+SELECT count(*) FROM airflow.main.dag_runs WHERE run_type = 'manual' AND logical_date >= TIMESTAMPTZ '2026-11-11 00:00:00+00';
+----
+1
+
+statement ok
+CREATE VIEW log2 AS SELECT * FROM read_json('{AIRFLOW_MOCK_V2}/__requests', columns = {'method': 'VARCHAR', 'path': 'VARCHAR', 'query': 'JSON'});
+
+query T
+SELECT count(*) > 0 FROM log2 WHERE path = '/api/v1/dags/~/dagRuns' AND query->>'$.execution_date_gte[0]' = '2026-11-11T00:00:00+00:00';
+----
+true
+
+query I
+SELECT count(*) FROM log2 WHERE query->>'$.run_type[0]' IS NOT NULL OR query->>'$.task_id[0]' IS NOT NULL;
+----
+0
+
+statement ok
+DETACH airflow;
