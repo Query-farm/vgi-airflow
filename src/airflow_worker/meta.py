@@ -76,15 +76,15 @@ CATALOG_DESCRIPTION = (
 
 CATALOG_DOC_LLM = (
     "Query one Apache Airflow deployment (Airflow 2.x /api/v1 or 3.x /api/v2, detected automatically) "
-    "through its stable REST API. Requires a DuckDB secret: CREATE SECRET (TYPE airflow, BASE_URL '...', "
-    "TOKEN '...') or with USERNAME/PASSWORD, created after ATTACH. Schema `main` has one table per resource: "
-    "dags, dag_runs, task_instances (latest try), task_instance_tries (every attempt), xcom_entries, assets, "
-    "asset_events, event_logs (audit log), import_errors, pools, variables (values always masked), connections "
-    "(no passwords; extra secrets masked), plus table functions task_logs(dag_id, run_id, task_id, "
-    "try_number := NULL) and variable_values(reveal := false). Schema `unified` has runs and task_runs in a "
-    "shape shared with other orchestrator workers (run_id there is '<dag_id>/<dag_run_id>'). Filters on dag_id, "
-    "run_id, task_id, state and date ranges are sent to the API; always filter by dag_id and a date range on "
-    "large deployments. Timestamps are `TIMESTAMPTZ` in UTC."
+    "through its stable REST API, self-managed or on Astronomer / Cloud Composer. Requires a DuckDB secret: "
+    "CREATE SECRET (TYPE airflow, BASE_URL '...', TOKEN '...') or with USERNAME/PASSWORD, created after ATTACH. "
+    "Schema `main` exposes Airflow's own model, one table per REST collection with the same columns on "
+    "Airflow 2 and 3: a DAG has runs, a run has task instances, a task instance has one or more tries, each "
+    "with its log; plus assets, pools, the audit log and configuration. Secrets stay in Airflow: variable "
+    "values are masked unless non-secret ones are requested, and connection passwords are never returned. "
+    "Schema `unified` reshapes runs and task runs into columns shared with other orchestrator workers for "
+    "UNION ALL. Filters on dag_id, run_id, task_id, state and date ranges are sent to the API; always filter "
+    "by dag_id and a date range on large deployments. Timestamps are `TIMESTAMPTZ` in UTC."
 )
 
 CATALOG_DOC_MD = (
