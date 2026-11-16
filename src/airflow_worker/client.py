@@ -227,7 +227,7 @@ def _retry_delay(header: str | None, attempt: int) -> float:
         try:
             when = email.utils.parsedate_to_datetime(header)
             return max(0.0, min((when - dt.datetime.now(dt.UTC)).total_seconds(), MAX_BACKOFF_SECONDS))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
     return min(0.5 * float(2**attempt), MAX_BACKOFF_SECONDS)
 
@@ -238,7 +238,7 @@ def _jwt_expiry(token: str) -> float:
         payload = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         return float(claims["exp"])
-    except (IndexError, KeyError, ValueError, TypeError):
+    except IndexError, KeyError, ValueError, TypeError:
         return time.time() + 3600
 
 

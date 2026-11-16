@@ -90,7 +90,7 @@ def parse_log(content: Any) -> list[dict[str, Any]]:
         try:
             chunks = ast.literal_eval(text)
             text = "\n".join(str(chunk[1]) for chunk in chunks)
-        except (ValueError, SyntaxError, IndexError, TypeError):
+        except ValueError, SyntaxError, IndexError, TypeError:
             pass
     for raw in text.splitlines():
         m = _V1_LINE.match(raw)
