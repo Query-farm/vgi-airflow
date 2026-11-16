@@ -1,6 +1,6 @@
 [project]
 name = "vgi-airflow-worker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Apache Airflow 2.x and 3.x stable REST API as SQL tables in DuckDB (a Query.Farm VGI worker)."
 readme = "README.md"
 license = "0BSD"
