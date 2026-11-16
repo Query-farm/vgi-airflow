@@ -37,7 +37,7 @@ INSTALL vgi FROM query_farm;
 LOAD vgi FROM query_farm;
 
 ATTACH 'airflow' (TYPE vgi,
-  LOCATION 'uvx --from git+https://github.com/Query-farm/vgi-airflow@v0.1.2 vgi-airflow-worker');
+  LOCATION 'uvx --from git+https://github.com/Query-farm/vgi-airflow@v0.1.3 vgi-airflow-worker');
 
 -- Credentials go in a DuckDB secret, created after ATTACH (which registers the secret type).
 CREATE SECRET af (TYPE airflow, BASE_URL 'http://localhost:8080',
