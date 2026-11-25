@@ -37,7 +37,7 @@ INSTALL vgi FROM query_farm;
 LOAD vgi FROM query_farm;
 
 ATTACH 'airflow' (TYPE vgi,
-  LOCATION 'uvx --from git+https://github.com/Query-farm/vgi-airflow@v0.1.3 vgi-airflow-worker');
+  LOCATION 'uvx --from git+https://github.com/Query-farm/vgi-airflow@v0.2.0 vgi-airflow-worker');
 
 -- Credentials go in a DuckDB secret, created after ATTACH (which registers the secret type).
 CREATE SECRET af (TYPE airflow, BASE_URL 'http://localhost:8080',
@@ -51,6 +51,8 @@ SELECT dag_id, is_paused, schedule, tags FROM airflow.main.dags ORDER BY dag_id;
 
 **From a checkout:** `make build`, then use
 `LOCATION '/abs/path/to/vgi-airflow/.venv/bin/vgi-airflow-worker'`.
+
+vgi-airflow 0.2.0 speaks VGI protocol 3.4, so it needs Haybarn 2.0.1 or newer (Haybarn 2.0.0 loads a 3.3 `vgi` extension that cannot attach it).
 
 ## Credentials
 
